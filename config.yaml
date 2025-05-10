@@ -1,0 +1,53 @@
+# Core MCP Server Configuration
+
+# Server settings
+host: "0.0.0.0"
+port: 8000
+log_level: "INFO"
+
+# Message handling
+max_message_size: 1048576  # 1MB
+message_timeout: 30  # seconds
+
+# Security
+enable_ssl: false
+ssl_cert: ""
+ssl_key: ""
+
+# Rate limiting
+rate_limit_enabled: true
+rate_limit_requests: 100
+rate_limit_period: 60  # seconds
+
+server:
+  host: "0.0.0.0"
+  port: 8000
+  debug: true
+
+kubernetes:
+  # Default namespace to use if not specified
+  default_namespace: "default"
+  # Whether to execute commands or just simulate
+  simulate_commands: true
+
+model:
+  # Default model to use for command generation
+  default: "gpt-4"
+  # Available models
+  available:
+    - "gpt-4"
+    - "gpt-3.5-turbo"
+    - "claude-3-opus"
+
+security:
+  # List of allowed origins for CORS
+  allowed_origins:
+    - "http://localhost:3000"
+    - "http://localhost:8080"
+  # Whether to require authentication
+  require_auth: false
+
+logging:
+  level: "INFO"
+  format: "{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}"
+  file: "server.log"
