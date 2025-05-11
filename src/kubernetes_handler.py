@@ -7,6 +7,8 @@ import subprocess
 from service_handler import ServiceHandler
 from dataclasses import dataclass
 from enum import Enum
+import asyncio
+import json
 
 class SecurityMode(Enum):
     """Security modes for command validation"""
@@ -20,9 +22,10 @@ class CommandResult:
     output: str
     error: Optional[str] = None
     exit_code: int = 0
+    analysis: Optional[Dict[str, Any]] = None
 
 class KubernetesHandler(ServiceHandler):
-    def __init__(self, security_mode: SecurityMode = SecurityMode.STRICT):
+    def __init__(self, security_mode: SecurityMode = SecurityMode.PERMISSIVE):
         """Initialize Kubernetes client and security settings"""
         try:
             # Try to load in-cluster config first
@@ -42,23 +45,40 @@ class KubernetesHandler(ServiceHandler):
         self.allowed_commands = {
             "kubectl": {
                 # Basic structure: kubectl <command> <resource-type>/<name> [any flags]
-                "get": r"^kubectl\s+get\s+(pods?|deployments?|services?|namespaces?|configmaps?|secrets?)(?:\s+[^\s]+)*$",
-                "describe": r"^kubectl\s+describe\s+(pod|deployment|service|namespace|configmap|secret)\s+\w+(?:\s+[^\s]+)*$",
-                "create": r"^kubectl\s+create\s+(deployment|namespace|service)\s+\w+(?:\s+[^\s]+)*$",
+                "get": r"^kubectl\s+get\s+(pods?|deployments?|services?|namespaces?|configmaps?|secrets?|nodes?)(?:\s+[^\s]+)*$",
+                "describe": r"^kubectl\s+describe\s+(pod|deployment|service|namespace|configmap|secret|node)\s+[^\s]+(?:\s+[^\s]+)*$",
+                "create": r"^kubectl\s+create(?:\s+[^\s]+)*\s+(deployment|namespace|service)(?:\s+[^\s]+)*$",
                 "delete": r"^kubectl\s+delete\s+(pod|deployment|service|namespace)\s+\w+(?:\s+[^\s]+)*$",
-                # Completely permissive logs pattern that allows any flags in any order
                 "logs": r"^kubectl\s+logs(?:\s+[^\s]+)*$",
                 "scale": r"^kubectl\s+scale\s+deployment\s+\w+(?:\s+[^\s]+)*$",
                 "exec": r"^kubectl\s+exec\s+(?:\s+[^\s]+)*\s+--\s+\w+.*$",
                 "config": r"^kubectl\s+config\s+(use-context|get-contexts|current-context)(?:\s+[^\s]+)*$"
             },
             "helm": {
-                # Keep helm commands as is since they're less frequently used
                 "list": r"^helm\s+list(\s+--all-namespaces|\s+-n\s+\w+)?$",
                 "install": r"^helm\s+install\s+\w+\s+\S+(\s+--namespace\s+\w+|\s+--set\s+\S+)*$",
                 "uninstall": r"^helm\s+uninstall\s+\w+(\s+--namespace\s+\w+)?$",
                 "upgrade": r"^helm\s+upgrade\s+\w+\s+\S+(\s+--namespace\s+\w+|\s+--set\s+\S+)*$"
             }
+        }
+
+        # Define pod state specific commands
+        self.pod_state_commands = {
+            "Pending": [
+                "kubectl describe nodes",
+                "kubectl get events --field-selector=reason=FailedScheduling",
+                "kubectl get pods --field-selector=status.phase=Pending -o wide"
+            ],
+            "CrashLoopBackOff": [
+                "kubectl logs {pod} --previous",
+                "kubectl describe pod {pod}",
+                "kubectl get pod {pod} -o yaml"
+            ],
+            "ImagePullBackOff": [
+                "kubectl describe pod {pod}",
+                "kubectl get secrets",
+                "kubectl get events --field-selector=reason=Failed"
+            ]
         }
 
         # Define forbidden patterns (regardless of security mode)
@@ -82,109 +102,109 @@ class KubernetesHandler(ServiceHandler):
             r".*--client-key=.*",
 
             # Additional dangerous patterns
-            r".*--force.*",  # Prevents force deletion
-            r".*--grace-period=0.*",  # Prevents immediate deletion
-            r".*--now.*",  # Prevents immediate deletion
-            r".*--cascade=orphan.*",  # Prevents orphaned resources
-            r".*--all.*",  # Prevents mass deletion
-            r".*--selector=.*",  # Prevents mass deletion by selector
-            r".*--field-selector=.*",  # Prevents mass deletion by field selector
-            r".*--all-namespaces.*delete.*",  # Prevents mass deletion across namespaces
-            r".*--dry-run=server.*",  # Prevents server-side dry run
-            r".*--server-side.*",  # Prevents server-side apply
-            r".*--force-conflicts.*",  # Prevents force conflicts
-            r".*--validate=false.*"  # Prevents skipping validation
+            r".*--force.*",
+            r".*--grace-period=0.*",
+            r".*--now.*",
+            r".*--cascade=orphan.*",
+            r".*delete.*--all.*",
+            r".*delete.*--selector=.*",
+            r".*delete.*--field-selector=.*",
+            r".*--all-namespaces.*delete.*",
+            r".*--dry-run=server.*",
+            r".*--server-side.*",
+            r".*--force-conflicts.*",
+            r".*--validate=false.*"
         ]
 
-    def _validate_command(self, command: str) -> Tuple[bool, Optional[str]]:
-        """Validate if a command is allowed based on security settings"""
-        logger.info(f"Validating command: {command}")
+    def _analyze_pod_state(self, output: str) -> Dict[str, Any]:
+        """Analyze pod state from command output"""
+        analysis = {
+            "state": None,
+            "issues": [],
+            "recommendations": []
+        }
 
-        # Check forbidden patterns first
-        for pattern in self.forbidden_patterns:
-            if re.match(pattern, command, re.IGNORECASE):
-                logger.warning(f"Command matches forbidden pattern: {pattern}")
-                return False, f"Command matches forbidden pattern: {pattern}"
+        # Check for Pending state
+        if "Pending" in output:
+            analysis["state"] = "Pending"
+            if "Insufficient" in output:
+                analysis["issues"].append("Insufficient resources")
+                analysis["recommendations"].append("Check node capacity and resource requests")
+            if "FailedScheduling" in output:
+                analysis["issues"].append("Scheduling failure")
+                analysis["recommendations"].append("Check node taints and pod tolerations")
 
-        if self.security_mode == SecurityMode.PERMISSIVE:
-            # In permissive mode, only check for forbidden patterns
-            return True, None
+        # Check for CrashLoopBackOff
+        elif "CrashLoopBackOff" in output:
+            analysis["state"] = "CrashLoopBackOff"
+            if "Error" in output:
+                analysis["issues"].append("Container error")
+                analysis["recommendations"].append("Check container logs and configuration")
 
-        # In strict mode, validate against allowed commands
-        parts = command.split()
-        if not parts:
-            logger.warning("Empty command")
-            return False, "Empty command"
+        # Check for ImagePullBackOff
+        elif "ImagePullBackOff" in output:
+            analysis["state"] = "ImagePullBackOff"
+            if "not found" in output:
+                analysis["issues"].append("Image not found")
+                analysis["recommendations"].append("Verify image name and registry access")
+            if "unauthorized" in output:
+                analysis["issues"].append("Registry authentication failed")
+                analysis["recommendations"].append("Check image pull secrets")
 
-        tool = parts[0]
-        if tool not in self.allowed_commands:
-            logger.warning(f"Tool {tool} not allowed. Allowed tools: {list(self.allowed_commands.keys())}")
-            return False, f"Tool {tool} not allowed"
+        return analysis
 
-        if len(parts) < 2:
-            logger.warning(f"Command too short: {command}")
-            return False, "Command too short"
-
-        subcommand = parts[1]
-        if subcommand not in self.allowed_commands[tool]:
-            logger.warning(f"Subcommand {subcommand} not allowed for {tool}. Allowed subcommands: {list(self.allowed_commands[tool].keys())}")
-            return False, f"Subcommand {subcommand} not allowed for {tool}"
-
-        pattern = self.allowed_commands[tool][subcommand]
-        logger.info(f"Checking command against pattern: {pattern}")
-
-        if not re.match(pattern, command, re.IGNORECASE):
-            logger.warning(f"Command '{command}' does not match pattern: {pattern}")
-            # Try to explain why it didn't match
-            if subcommand == "get":
-                if not any(resource in command for resource in ["pod", "deployment", "service", "namespace", "configmap", "secret"]):
-                    return False, "Command must specify a valid resource type (pod, deployment, service, namespace, configmap, or secret)"
-                if not any(flag in command for flag in ["--all-namespaces", "-n"]):
-                    return False, "Command must include either --all-namespaces or -n <namespace>"
-            return False, f"Command does not match allowed pattern: {pattern}"
-
-        logger.info(f"Command '{command}' is valid")
-        return True, None
-
-    async def execute_command(self, command: str) -> CommandResult:
-        """Execute a validated kubectl or helm command"""
+    async def execute_command(self, command: str) -> Dict[str, Any]:
+        """Execute a kubectl command and return the result"""
         try:
-            # Validate command
-            is_valid, error = self._validate_command(command)
-            if not is_valid:
-                logger.error(f"Command validation failed: {error}")
-                return CommandResult(success=False, output="", error=error, exit_code=1)
+            # Validate the command first
+            if not await self.validate_command(command):
+                return {
+                    "success": False,
+                    "error": "Invalid command"
+                }
 
-            # Execute command
+            # Execute the command
             logger.info(f"Executing command: {command}")
-            process = subprocess.Popen(
-                command.split(),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
+            process = await asyncio.create_subprocess_shell(
+                command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
             )
-            stdout, stderr = process.communicate()
+            stdout, stderr = await process.communicate()
 
-            if process.returncode != 0:
-                logger.error(f"Command failed with error: {stderr}")
+            # Check if the command was successful
+            if process.returncode == 0:
+                output = stdout.decode().strip()
+                logger.info(f"Command executed successfully. Output: {output}")
+
+                # Analyze the output for pod states
+                analysis = await self._analyze_pod_state(output)
+
+                return {
+                    "success": True,
+                    "raw_output": output,
+                    "output": output,
+                    "analysis": analysis
+                }
             else:
-                logger.info("Command executed successfully")
-
-            return CommandResult(
-                success=process.returncode == 0,
-                output=stdout,
-                error=stderr if process.returncode != 0 else None,
-                exit_code=process.returncode
-            )
+                error = stderr.decode().strip()
+                logger.error(f"Command failed: {error}")
+                return {
+                    "success": False,
+                    "error": error,
+                    "raw_output": error,
+                    "analysis": {"state": "Error", "issues": [error], "recommendations": ["Check command syntax and permissions"]}
+                }
 
         except Exception as e:
-            logger.error(f"Error executing command '{command}': {str(e)}")
-            return CommandResult(
-                success=False,
-                output="",
-                error=str(e),
-                exit_code=1
-            )
+            error_msg = f"Error executing command: {str(e)}"
+            logger.error(error_msg)
+            return {
+                "success": False,
+                "error": error_msg,
+                "raw_output": error_msg,
+                "analysis": {"state": "Error", "issues": [str(e)], "recommendations": ["Check system configuration"]}
+            }
 
     async def get_service_info(self) -> Dict[str, Any]:
         """Get information about the Kubernetes service"""
@@ -197,7 +217,8 @@ class KubernetesHandler(ServiceHandler):
                 "capabilities": {
                     "kubectl": list(self.allowed_commands["kubectl"].keys()),
                     "helm": list(self.allowed_commands["helm"].keys())
-                }
+                },
+                "pod_states": list(self.pod_state_commands.keys())
             }
         except Exception as e:
             logger.error(f"Error getting Kubernetes service info: {str(e)}")
@@ -206,30 +227,172 @@ class KubernetesHandler(ServiceHandler):
     async def handle_command(self, command: str, parameters: Dict[str, Any]) -> Dict[str, Any]:
         """Handle a command by executing it directly"""
         try:
-            # The command should be a pre-formatted kubectl or helm command
-            # Parameters are ignored as the command should be complete
             result = await self.execute_command(command)
-
-            if not result.success:
-                raise ValueError(f"Command failed: {result.error}")
+            if not result["success"]:
+                raise ValueError(f"Command failed: {result['error']}")
 
             return {
                 "status": "success",
-                "output": result.output,
-                "command": command
+                "output": result["output"],
+                "command": command,
+                "analysis": result.get("analysis")
             }
 
         except Exception as e:
             logger.error(f"Error handling command {command}: {str(e)}")
             raise
 
-    async def validate_command(self, command: str, parameters: Dict[str, Any]) -> bool:
+    async def validate_command(self, command: str) -> bool:
         """Validate if a command can be handled by this service"""
         try:
-            # For Kubernetes handler, we only validate the command string
-            # Parameters are ignored as they are part of the command string
-            is_valid, _ = self._validate_command(command)
-            return is_valid
+            # Skip validation in permissive mode
+            if self.security_mode == SecurityMode.PERMISSIVE:
+                return True
+
+            # Check forbidden patterns first
+            for pattern in self.forbidden_patterns:
+                if re.match(pattern, command, re.IGNORECASE):
+                    logger.warning(f"Command matches forbidden pattern: {pattern}")
+                    return False
+
+            # Check allowed commands
+            for tool, commands in self.allowed_commands.items():
+                for cmd, pattern in commands.items():
+                    if re.match(pattern, command, re.IGNORECASE):
+                        return True
+
+            logger.warning(f"Command not in allowed patterns: {command}")
+            return False
+
         except Exception as e:
             logger.error(f"Error validating command: {str(e)}")
             return False
+
+    async def _analyze_pod_state(self, command: str, output: str = "") -> Dict[str, Any]:
+        """Analyze pod state from command output"""
+        try:
+            analysis = {
+                "state": None,
+                "issues": [],
+                "recommendations": []
+            }
+
+            # If no output provided, return empty analysis
+            if not output:
+                return analysis
+
+            # Check for ContainerCreating state
+            if "ContainerCreating" in output:
+                analysis["state"] = "ContainerCreating"
+                pod_name = None
+                namespace = None
+
+                # Extract pod name and namespace from the command
+                if "describe pods" in command:
+                    # Extract namespace from -n flag
+                    if "-n" in command:
+                        namespace = command.split("-n")[1].split()[0].strip()
+                    # Extract pod name from the command
+                    if "-l" in command:
+                        # If using label selector, we need to get pod names
+                        pod_list_cmd = f"kubectl get pods -n {namespace} -l app=nr-ebpf-agent -o jsonpath='{{.items[*].metadata.name}}'"
+                        pod_names = await self.execute_command(pod_list_cmd)
+                        if pod_names.success:
+                            pod_name = pod_names.output.split()[0]  # Get first pod
+                    else:
+                        # Extract pod name directly
+                        pod_name = command.split("describe pods")[1].strip().split()[0]
+
+                if pod_name and namespace:
+                    # Get detailed pod information
+                    describe_cmd = f"kubectl describe pod {pod_name} -n {namespace}"
+                    describe_output = await self.execute_command(describe_cmd)
+
+                    # Get events for the namespace
+                    events_cmd = f"kubectl get events -n {namespace} --sort-by='.lastTimestamp'"
+                    events_output = await self.execute_command(events_cmd)
+
+                    # Check for common ContainerCreating issues
+                    if "ImagePullBackOff" in describe_output.output:
+                        analysis["issues"].append("Container image pull failed")
+                        analysis["recommendations"].extend([
+                            "Check if the image exists in the registry",
+                            "Verify image pull secrets are configured correctly",
+                            "Check network connectivity to the container registry"
+                        ])
+
+                    if "FailedScheduling" in events_output.output:
+                        analysis["issues"].append("Pod scheduling failed")
+                        analysis["recommendations"].extend([
+                            "Check node resource availability",
+                            "Verify node selectors and affinity rules",
+                            "Check for taints and tolerations"
+                        ])
+
+                    if "FailedMount" in describe_output.output:
+                        analysis["issues"].append("Volume mount failed")
+                        analysis["recommendations"].extend([
+                            "Check if the volume exists",
+                            "Verify volume mount permissions",
+                            "Check for storage class issues"
+                        ])
+
+                    if "CrashLoopBackOff" in describe_output.output:
+                        analysis["issues"].append("Container is crashing")
+                        analysis["recommendations"].extend([
+                            "Check container logs for errors",
+                            "Verify container configuration",
+                            "Check resource limits and requests"
+                        ])
+
+                    if not analysis["issues"]:
+                        analysis["issues"].append("Container is still being created")
+                        analysis["recommendations"].extend([
+                            "Check pod events for more details",
+                            "Verify container image and registry access",
+                            "Check for resource constraints"
+                        ])
+
+                    analysis["details"] = {
+                        "pod_name": pod_name,
+                        "namespace": namespace,
+                        "events": events_output.output if events_output.success else "Could not fetch events",
+                        "pod_details": describe_output.output if describe_output.success else "Could not fetch pod details"
+                    }
+
+            # Check for Pending state
+            elif "Pending" in output:
+                analysis["state"] = "Pending"
+                if "Insufficient" in output:
+                    analysis["issues"].append("Insufficient resources")
+                    analysis["recommendations"].append("Check node capacity and resource requests")
+                if "FailedScheduling" in output:
+                    analysis["issues"].append("Scheduling failure")
+                    analysis["recommendations"].append("Check node taints and pod tolerations")
+
+            # Check for CrashLoopBackOff
+            elif "CrashLoopBackOff" in output:
+                analysis["state"] = "CrashLoopBackOff"
+                if "Error" in output:
+                    analysis["issues"].append("Container error")
+                    analysis["recommendations"].append("Check container logs and configuration")
+
+            # Check for ImagePullBackOff
+            elif "ImagePullBackOff" in output:
+                analysis["state"] = "ImagePullBackOff"
+                if "not found" in output:
+                    analysis["issues"].append("Image not found")
+                    analysis["recommendations"].append("Verify image name and registry access")
+                if "unauthorized" in output:
+                    analysis["issues"].append("Registry authentication failed")
+                    analysis["recommendations"].append("Check image pull secrets")
+
+            return analysis
+
+        except Exception as e:
+            logger.error(f"Error analyzing pod state: {str(e)}")
+            return {
+                "state": "Error",
+                "issues": [f"Error analyzing pod state: {str(e)}"],
+                "recommendations": ["Check command syntax and permissions"]
+            }

@@ -69,7 +69,7 @@ function App() {
         content: data.error
           ? `Error: ${data.error}`
           : data.output
-            ? `Command: ${data.command}\n\nOutput:\n${data.output}`
+            ? `Command: ${data.command}\n\nOutput:\n${data.output}${data.summary ? `\n\nSummary:\n${data.summary}` : ''}`
             : `Command: ${data.command}`,
         timestamp: new Date()
       }
