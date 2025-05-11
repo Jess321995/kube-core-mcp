@@ -52,7 +52,7 @@ k8s_apps_api = client.AppsV1Api()
 
 # Initialize service handlers
 service_handlers = {
-    "kubernetes": KubernetesHandler(security_mode=SecurityMode.STRICT),
+    "kubernetes": KubernetesHandler(security_mode=SecurityMode.PERMISSIVE),
     "llm": LLMHandler()
 }
 
@@ -141,30 +141,49 @@ async def handle_command(request: CommandRequest) -> CommandResult:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/nl")
-async def handle_natural_language(request: NaturalLanguageRequest) -> Dict[str, Any]:
-    """Handle natural language commands"""
+async def handle_natural_language(request: NaturalLanguageRequest):
+    """Handle natural language requests"""
     try:
-        # First, let the LLM understand the command and generate a kubectl command
-        understanding = await service_handlers["llm"].understand_command(request.message)
+        # Get the LLM handler
+        llm_handler = service_handlers.get("llm")
+        if not llm_handler:
+            raise HTTPException(status_code=500, detail="LLM service not available")
 
-        if not understanding.get("success", False):
-            raise HTTPException(status_code=400, detail=understanding.get("error", "Failed to understand command"))
+        # Process the request through the LLM
+        result = await llm_handler.understand_command(request.message)
 
-        # Extract the generated kubectl command from the LLM's response
-        command = understanding.get("command", "")
-        if not command:
-            raise HTTPException(status_code=400, detail="No command generated")
+        if not result["success"]:
+            raise HTTPException(status_code=400, detail=result["error"])
 
-        # Execute the command using the Kubernetes handler
-        result = await service_handlers["kubernetes"].execute_command(command)
+        # If we have a command, execute it
+        if "command" in result:
+            k8s_handler = service_handlers.get("kubernetes")
+            if not k8s_handler:
+                raise HTTPException(status_code=500, detail="Kubernetes service not available")
 
-        return {
-            "status": "success",
-            "message": "Command executed successfully",
-            "command": command,
-            "output": result.output,
-            "error": result.error if not result.success else None
+            # Execute the command
+            command_result = await k8s_handler.execute_command(result["command"])
+
+            # Add the command result to our response
+            result["command_result"] = command_result
+
+            # If we have raw output, generate a summary
+            if command_result.get("success") and "raw_output" in command_result:
+                summary = await llm_handler.summarize_output(command_result["raw_output"])
+                result["summary"] = summary
+
+        # Construct a cleaner response structure
+        response = {
+            "success": True,
+            "command": result.get("command", ""),
+            "output": result.get("command_result", {}).get("raw_output", ""),  # Use output instead of raw_output
+            "summary": result.get("summary", ""),
+            "analysis": result.get("command_result", {}).get("analysis", {}),  # Include analysis if available
+            "error": result.get("command_result", {}).get("error")  # Include error if any
         }
+
+        logger.debug(f"Returning response: {response}")
+        return response
 
     except Exception as e:
         logger.error(f"Error handling natural language request: {str(e)}")

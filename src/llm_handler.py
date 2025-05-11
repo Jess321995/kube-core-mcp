@@ -5,6 +5,16 @@ import json
 import os
 from botocore.exceptions import ClientError
 from service_handler import ServiceHandler
+from dataclasses import dataclass
+from datetime import datetime
+
+@dataclass
+class ConversationContext:
+    """Maintains conversation context for better command generation"""
+    messages: List[Dict[str, str]]
+    last_command: Optional[str]
+    last_output: Optional[str]
+    timestamp: datetime
 
 class LLMHandler(ServiceHandler):
     """Handler for LLM-based command understanding and processing using AWS Bedrock"""
@@ -24,6 +34,14 @@ class LLMHandler(ServiceHandler):
 
             # Load the prompt template
             self.prompt_template = self._load_prompt_template()
+
+            # Initialize conversation context
+            self.conversation_context = ConversationContext(
+                messages=[],
+                last_command=None,
+                last_output=None,
+                timestamp=datetime.now()
+            )
 
             # Verify model access
             self._verify_model_access()
@@ -47,24 +65,66 @@ class LLMHandler(ServiceHandler):
         except Exception as e:
             logger.error(f"Error loading prompt template: {str(e)}")
             # Fallback to hardcoded prompt if file reading fails
-            return """You are a Kubernetes expert. Convert the following request into a kubectl or helm command.
-            Rules:
-            1. Only output the command, no explanations
-            2. Use standard kubectl/helm syntax
-            3. Include all necessary flags and parameters
-            4. For create commands, use appropriate defaults if not specified
-            5. For deployments, always include --image flag
-            6. For services, always include --port flag
-            7. ALWAYS include namespace:
-               - Use -n <namespace> if a specific namespace is mentioned
-               - Use --all-namespaces if "all namespaces" is mentioned
-               - Use -n default if no namespace is specified
-            8. For security, never use --privileged or other dangerous flags
-            9. For get commands, follow these patterns exactly:
-               - kubectl get pods -n <namespace>
-               - kubectl get pods --all-namespaces
-               - kubectl get pods <pod-name> -n <namespace>
-            10. Never omit the namespace flag
+            return """You are a Kubernetes expert. Your role is to help users understand and troubleshoot their Kubernetes clusters by converting their questions into appropriate kubectl commands.
+
+            IMPORTANT: You must output ONLY a single kubectl command or a chain of kubectl commands joined by &&. Do not include explanations, steps, or markdown formatting.
+
+            Core Principles:
+            1. Security First
+               - Never use dangerous flags like --privileged
+               - Avoid commands that could expose sensitive data
+               - Use appropriate RBAC permissions
+
+            2. Context Awareness
+               - Always consider namespace context
+               - Use --all-namespaces when appropriate
+               - Include relevant labels and selectors
+
+            3. Troubleshooting Approach
+               - Start with basic resource inspection
+               - Progress to detailed diagnostics when needed
+               - Use appropriate output formats (-o wide, -o yaml, etc.)
+               - Chain commands with && when multiple commands are needed
+
+            4. Common Patterns
+               - For resource discovery: get -> describe -> logs
+               - For debugging: events -> logs -> describe
+               - For status checks: get with appropriate selectors
+               - For configuration: get with -o yaml
+
+            5. Error Investigation
+               - Check pod status and conditions
+               - Review container logs
+               - Examine events
+               - Verify resource availability
+               - Check configuration issues
+
+            6. Best Practices
+               - Use field selectors for efficient filtering
+               - Include relevant labels for better identification
+               - Use appropriate output formats for readability
+               - Chain commands with && when needed for complete information
+
+            When handling requests:
+            1. Understand the user's intent
+            2. Choose appropriate commands based on context
+            3. Include necessary flags and parameters
+            4. Ensure commands follow security best practices
+            5. Provide complete information for troubleshooting
+
+            For "why" questions:
+            1. Gather diagnostic information
+            2. Check relevant logs and events
+            3. Examine resource configuration
+            4. Look for common failure patterns
+            5. Consider cluster-wide issues
+
+            For troubleshooting:
+            1. Identify the affected resources
+            2. Check resource status and conditions
+            3. Review relevant logs and events
+            4. Examine configuration and dependencies
+            5. Consider cluster-wide factors
 
             Request: {message}
 
@@ -81,7 +141,7 @@ class LLMHandler(ServiceHandler):
             logger.error(f"Failed to verify LLM access: {str(e)}")
             raise
 
-    def _call_llm(self, prompt: str) -> str:
+    async def _call_llm(self, prompt: str) -> str:
         """Call the LLM with a prompt and return the response"""
         try:
             if self.provider == 'anthropic':
@@ -93,11 +153,22 @@ class LLMHandler(ServiceHandler):
                         "messages": [{
                             "role": "user",
                             "content": prompt
-                        }]
+                        }],
+                        "temperature": 0.1  # Lower temperature for more consistent output
                     })
                 )
                 response_body = json.loads(response['body'].read())
-                return response_body['content'][0]['text']
+                logger.debug(f"Raw LLM response: {json.dumps(response_body, indent=2)}")
+
+                # Check if we have the expected response structure
+                if 'content' not in response_body or not response_body['content']:
+                    raise ValueError(f"Unexpected response structure: {response_body}")
+
+                # Return the full response text
+                response_text = response_body['content'][0]['text'].strip()
+                logger.debug(f"Full LLM response: {response_text}")
+                return response_text
+
             else:
                 raise ValueError(f"Unsupported LLM provider: {self.provider}")
 
@@ -105,31 +176,48 @@ class LLMHandler(ServiceHandler):
             logger.error(f"Error calling LLM: {str(e)}")
             raise
 
+    def _build_context(self, message: str) -> str:
+        """Build context from conversation history"""
+        context = []
+
+        # Add last command and output if available
+        if self.conversation_context.last_command:
+            context.append(f"Last command executed: {self.conversation_context.last_command}")
+        if self.conversation_context.last_output:
+            context.append(f"Last command output: {self.conversation_context.last_output}")
+
+        # Add relevant conversation history
+        for msg in self.conversation_context.messages[-3:]:  # Keep last 3 messages
+            context.append(f"{msg['role']}: {msg['content']}")
+
+        return "\n".join(context)
+
     async def understand_command(self, message: str) -> Dict[str, Any]:
-        """Convert natural language to a kubectl command"""
+        """Convert natural language to kubectl command"""
         try:
-            # Use the prompt template with the message
-            prompt = self.prompt_template.format(message=message)
+            # Update conversation context
+            self.conversation_context.messages.append({
+                "role": "user",
+                "content": message
+            })
 
-            # Get the command from the LLM
-            command = self._call_llm(prompt).strip()
+            # Build context-aware prompt
+            context = self._build_context(message)
+            prompt = f"{self.prompt_template}\n\nContext:\n{context}\n\nUser: {message}\nCommand:"
 
-            # Basic validation of the command
-            if not command.startswith(('kubectl ', 'helm ')):
-                return {
-                    "success": False,
-                    "error": "Generated command is not a valid kubectl or helm command"
-                }
+            # Call the LLM
+            response = await self._call_llm(prompt)
 
-            # Ensure get commands include namespace
-            if command.startswith('kubectl get '):
-                if '-n ' not in command and '--all-namespaces' not in command:
-                    # Add default namespace if missing
-                    command = f"{command} -n default"
+            # Extract the command from the response
+            command = response.strip()
+
+            # Update conversation context with the command
+            self.conversation_context.last_command = command
 
             return {
                 "success": True,
-                "command": command
+                "command": command,
+                "response": response
             }
 
         except Exception as e:
@@ -139,37 +227,92 @@ class LLMHandler(ServiceHandler):
                 "error": str(e)
             }
 
+    async def summarize_output(self, output: str) -> str:
+        """Summarize the command output using the LLM"""
+        try:
+            # Update conversation context with the output
+            self.conversation_context.last_output = output
+
+            # Check for ContainerCreating state
+            if "ContainerCreating" in output:
+                # Build a more detailed prompt for ContainerCreating analysis
+                prompt = f"""You are a Kubernetes expert. Analyze the following output and provide a detailed analysis focusing on:
+                1. The specific reason why pods are stuck in ContainerCreating state
+                2. Common causes for ContainerCreating issues:
+                   - Image pull issues (missing image, registry access)
+                   - Volume mount problems
+                   - Resource constraints
+                   - Network configuration issues
+                   - Security context issues
+                3. Specific steps to troubleshoot and resolve the issue
+                4. Commands that would help diagnose the root cause
+
+                Output to analyze:
+                {output}
+
+                Provide a structured response with:
+                1. Problem Analysis
+                2. Likely Causes
+                3. Troubleshooting Steps
+                4. Diagnostic Commands
+                """
+
+                summary = await self._call_llm(prompt)
+                return summary.strip()
+
+            # For other types of output, use the existing logic
+            if not any(keyword in output.lower() for keyword in ['error', 'warning', 'failed', 'not found', 'crash', 'exception', 'pending']):
+                return "No issues found in the output."
+
+            # Build context-aware prompt for summarization
+            context = self._build_context("Summarize the following output:")
+            prompt = f"""You are a Kubernetes expert. Analyze the following kubectl command output and provide a concise summary focusing ONLY on:
+            - Error messages and their root causes
+            - Warning signs
+            - Failed operations
+            - Resource not found issues
+            - Pod state issues (especially Pending)
+            - Any other problems that need attention
+
+            Context:
+            {context}
+
+            Command output:
+            {output}
+
+            Summary:"""
+
+            summary = await self._call_llm(prompt)
+            return summary.strip()
+
+        except Exception as e:
+            logger.error(f"Error summarizing output: {str(e)}")
+            return f"Error summarizing output: {str(e)}"
+
     async def get_service_info(self) -> Dict[str, Any]:
         """Get information about the LLM service"""
         return {
             "name": "llm",
-            "provider": self.provider,
             "model": self.model_id,
-            "capabilities": ["command_generation"]
+            "capabilities": [
+                "natural_language_understanding",
+                "command_generation",
+                "output_summarization",
+                "context_aware_responses"
+            ]
         }
 
     async def handle_command(self, command: str, parameters: Dict[str, Any]) -> Dict[str, Any]:
-        """Handle LLM commands"""
-        if command == "understand":
-            return await self.understand_command(parameters.get("text", ""))
-        else:
-            raise ValueError(f"Unknown LLM command: {command}")
+        """Handle a command by understanding it first"""
+        try:
+            result = await self.understand_command(command)
+            if not result["success"]:
+                raise ValueError(f"Failed to understand command: {result.get('error')}")
+            return result
+        except Exception as e:
+            logger.error(f"Error handling command: {str(e)}")
+            raise
 
     async def validate_command(self, command: str, parameters: Dict[str, Any]) -> bool:
-        """Validate if a command can be handled by the LLM service"""
-        try:
-            # For LLM handler, we only support the 'understand' command
-            valid_commands = ["understand"]
-            if command not in valid_commands:
-                logger.warning(f"Invalid LLM command: {command}")
-                return False
-
-            # For 'understand' command, we need a 'text' parameter
-            if command == "understand" and "text" not in parameters:
-                logger.warning("Missing required 'text' parameter for understand command")
-                return False
-
-            return True
-        except Exception as e:
-            logger.error(f"Error validating LLM command: {str(e)}")
-            return False
+        """Validate if a command can be handled by this service"""
+        return True  # LLM can handle any natural language input
