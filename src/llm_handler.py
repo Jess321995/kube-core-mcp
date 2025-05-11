@@ -85,6 +85,10 @@ class LLMHandler(ServiceHandler):
                - Progress to detailed diagnostics when needed
                - Use appropriate output formats (-o wide, -o yaml, etc.)
                - Chain commands with && when multiple commands are needed
+               - For logs:
+                 * Use --previous flag ONLY for pods in CrashLoopBackOff or Error states
+                 * For ContainerCreating pods, get current logs without --previous
+                 * For Pending pods, focus on events and pod description
 
             4. Common Patterns
                - For resource discovery: get -> describe -> logs

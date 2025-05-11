@@ -163,38 +163,99 @@ class KubernetesHandler(ServiceHandler):
                     "error": "Invalid command"
                 }
 
-            # Execute the command
-            logger.info(f"Executing command: {command}")
-            process = await asyncio.create_subprocess_shell(
-                command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await process.communicate()
+            # Check if this is a chained command
+            if "&&" in command:
+                # Split the command into parts
+                command_parts = [part.strip() for part in command.split("&&")]
+                combined_output = []
+                combined_analysis = {
+                    "state": None,
+                    "issues": [],
+                    "recommendations": [],
+                    "partial_success": False
+                }
+                any_success = False
 
-            # Check if the command was successful
-            if process.returncode == 0:
-                output = stdout.decode().strip()
-                logger.info(f"Command executed successfully. Output: {output}")
+                # Execute each part separately
+                for part in command_parts:
+                    logger.info(f"Executing command part: {part}")
+                    process = await asyncio.create_subprocess_shell(
+                        part,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    stdout, stderr = await process.communicate()
 
-                # Analyze the output for pod states
-                analysis = await self._analyze_pod_state(output)
+                    if process.returncode == 0:
+                        output = stdout.decode().strip()
+                        if output:  # Only add non-empty output
+                            combined_output.append(f"=== Output from: {part} ===\n{output}")
+                        any_success = True
+                        # Analyze this part's output
+                        part_analysis = await self._analyze_pod_state(part, output)
+                        # Merge analysis results
+                        if part_analysis["state"]:
+                            combined_analysis["state"] = part_analysis["state"]
+                        combined_analysis["issues"].extend(part_analysis["issues"])
+                        combined_analysis["recommendations"].extend(part_analysis["recommendations"])
+                        if "details" in part_analysis:
+                            combined_analysis["details"] = part_analysis["details"]
+                    else:
+                        error = stderr.decode().strip()
+                        if error:  # Only add non-empty errors
+                            combined_output.append(f"=== Error from: {part} ===\n{error}")
+                        logger.warning(f"Command part failed: {error}")
+
+                # Combine all outputs
+                final_output = "\n\n".join(combined_output)
+
+                # Set partial success flag if some commands succeeded
+                if any_success:
+                    combined_analysis["partial_success"] = True
+                    if not combined_analysis["issues"]:
+                        combined_analysis["issues"].append("Some commands succeeded but others failed")
+                        combined_analysis["recommendations"].append("Review the output for each command part")
 
                 return {
-                    "success": True,
-                    "raw_output": output,
-                    "output": output,
-                    "analysis": analysis
+                    "success": any_success,  # Consider it a success if any part succeeded
+                    "raw_output": final_output,
+                    "output": final_output,
+                    "analysis": combined_analysis
                 }
+
             else:
-                error = stderr.decode().strip()
-                logger.error(f"Command failed: {error}")
-                return {
-                    "success": False,
-                    "error": error,
-                    "raw_output": error,
-                    "analysis": {"state": "Error", "issues": [error], "recommendations": ["Check command syntax and permissions"]}
-                }
+                # Execute single command
+                logger.info(f"Executing command: {command}")
+                process = await asyncio.create_subprocess_shell(
+                    command,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, stderr = await process.communicate()
+
+                # Check if the command was successful
+                if process.returncode == 0:
+                    output = stdout.decode().strip()
+                    logger.info(f"Command executed successfully. Output: {output}")
+
+                    # Analyze the output for pod states
+                    analysis = await self._analyze_pod_state(output)
+
+                    return {
+                        "success": True,
+                        "raw_output": output,
+                        "output": output,
+                        "analysis": analysis
+                    }
+                else:
+                    error = stderr.decode().strip()
+                    logger.error(f"Command failed: {error}")
+                    return {
+                        "success": False,
+                        "error": error,
+                        "raw_output": error,
+                        "analysis": {"state": "Error", "issues": [error], "recommendations": ["Check command syntax and permissions"]}
+                    }
 
         except Exception as e:
             error_msg = f"Error executing command: {str(e)}"
